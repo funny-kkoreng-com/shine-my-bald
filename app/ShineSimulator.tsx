@@ -16,16 +16,21 @@ const SUN_START = 100;
 const MAX_SHINE = 130;
 const GAIN = 2.2; // 비비는 세기 1당 초당 광택 증가량
 const DECAY = 3; // 안 비빌 때 초당 광택 감소량
+const WIPE_ALPHA = 0.015; // 비비는 세기 1당 한 프레임에 벗겨지는 바가지 머리의 양
+const WIPE_SHINE = 30; // 바가지 머리를 다 벗기면 광택이 여기까지 찬다 (나머지는 맨머리 광내기)
+const PAINT_DONE = 0.04; // 남은 칠이 이 비율 아래로 떨어지면 다 닦은 것으로 처리
+const BEST_KEY = "shine-my-bald:best";
 const RUB_DEADZONE = 1;
 const RUB_CAP = 12;
 
 const PALM_IDX = [0, 5, 9, 13, 17];
 
 const LEVELS: [number, string][] = [
-  [0, "무광 매트"],
-  [15, "은은한 윤기"],
-  [35, "반질반질"],
-  [60, "거울 수준"],
+  [0, "바가지 머리"],
+  [12, "벗겨지는 중"],
+  [WIPE_SHINE, "은은한 윤기"],
+  [45, "반질반질"],
+  [65, "거울 수준"],
   [85, "눈뽕 주의"],
   [SUN_START, "☀️ 태양 모드"],
 ];
@@ -43,16 +48,59 @@ const SPARKLES = [
   { x: 55, y: 175, r: 11, d: 0.7 },
 ];
 
+const HAIR_COLOR = "#2b2219";
+
+// 바가지 머리 외곽 (SVG 좌표). 두상에 딱 붙어서 살짝만 크고, 앞머리는 이마에서 일자로 끊긴다.
+const BOWL_PATH =
+  "M86,200 C80,100 135,52 200,52 C265,52 320,100 314,200 L298,200 C297,180 292,164 284,152 L116,152 C108,164 103,180 102,200 Z";
+
+const rnd = (a: number, b: number) => a + Math.random() * (b - a);
+
+// 손으로 문질러 벗겨낼 바가지 머리 (가발처럼 씌워져 있음)
+function paintHead(canvas: HTMLCanvasElement) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  ctx.globalCompositeOperation = "source-over";
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = HAIR_COLOR;
+  ctx.fill(new Path2D(BOWL_PATH));
+
+  // 앞머리 끝: 일자 단발 끝이 살짝 삐죽삐죽
+  for (let x = 116; x < 286; x += 8) {
+    ctx.beginPath();
+    ctx.moveTo(x, 150);
+    ctx.lineTo(x + 4, 152 + rnd(3, 7));
+    ctx.lineTo(x + 8, 150);
+    ctx.fill();
+  }
+}
+
+// 칠이 남아 있는 픽셀 수 (4픽셀 간격 샘플링)
+function countPaint(canvas: HTMLCanvasElement) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  let n = 0;
+  for (let y = 0; y < canvas.height; y += 4) {
+    for (let x = 0; x < canvas.width; x += 4) {
+      if (data[(y * canvas.width + x) * 4 + 3] > 40) n++;
+    }
+  }
+  return n;
+}
+
 type CamStatus = "off" | "loading" | "on" | "error";
 type Vec = { x: number; y: number };
 type View = {
+  paint: number;
+  elapsed: number;
   shine: number;
   rub: number;
   hands: number;
   onHead: number;
   burnedOut: boolean;
 };
+type Result = { time: number; best: number; isNew: boolean };
 type ScreenPalm = { x: number; y: number; size: number; onHead: boolean };
+type Wipe = { x: number; y: number; size: number; speed: number };
 
 function palmOf(lm: NormalizedLandmark[]) {
   const c = PALM_IDX.reduce(
@@ -88,6 +136,8 @@ const STAR =
 
 export default function ShineSimulator() {
   const [view, setView] = useState<View>({
+    paint: 1,
+    elapsed: 0,
     shine: 0,
     rub: 0,
     hands: 0,
@@ -96,12 +146,20 @@ export default function ShineSimulator() {
   });
   const [cam, setCam] = useState<CamStatus>("off");
   const [camError, setCamError] = useState("");
+  const [result, setResult] = useState<Result | null>(null);
+  const [photo, setPhoto] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const landmarkerRef = useRef<HandLandmarker | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
+  const paintRef = useRef(1);
+  const paintCanvasRef = useRef<HTMLCanvasElement>(null);
+  const paintTotalRef = useRef(1);
+  const startRef = useRef<number | null>(null);
+  const endRef = useRef<number | null>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
   const shineRef = useRef(0);
   const rubRef = useRef(0);
   const burnedOutRef = useRef(false);
@@ -119,7 +177,8 @@ export default function ShineSimulator() {
     (landmarks: NormalizedLandmark[][], t: number) => {
       const video = videoRef.current;
       const head = headRef.current;
-      if (!video || !head) return { speed: 0, onHead: [] as boolean[] };
+      if (!video || !head)
+        return { speed: 0, onHead: [] as boolean[], wipes: [] as Wipe[] };
 
       const hr = head.getBoundingClientRect();
       const cx = hr.left + hr.width / 2;
@@ -143,9 +202,10 @@ export default function ShineSimulator() {
       const prev = prevPalmsRef.current;
       prevPalmsRef.current = { palms, t };
       const onHead = palms.map((p) => p.onHead);
-      if (!prev) return { speed: 0, onHead };
+      const wipes: Wipe[] = [];
+      if (!prev) return { speed: 0, onHead, wipes };
       const dt = (t - prev.t) / 1000;
-      if (dt <= 0 || dt > 0.3) return { speed: 0, onHead };
+      if (dt <= 0 || dt > 0.3) return { speed: 0, onHead, wipes };
 
       let best = 0;
       for (const p of palms) {
@@ -156,10 +216,14 @@ export default function ShineSimulator() {
           nearest = Math.min(nearest, Math.hypot(p.x - q.x, p.y - q.y));
         }
         if (nearest > p.size * 2) continue;
-        best = Math.max(best, nearest / dt / p.size);
+        const v = nearest / dt / p.size;
+        best = Math.max(best, v);
+        if (v >= RUB_DEADZONE) {
+          wipes.push({ x: p.x, y: p.y, size: p.size, speed: Math.min(v, RUB_CAP) });
+        }
       }
       const speed = best < RUB_DEADZONE ? 0 : Math.min(best, RUB_CAP);
-      return { speed, onHead };
+      return { speed, onHead, wipes };
     },
     [],
   );
@@ -204,10 +268,131 @@ export default function ShineSimulator() {
     [],
   );
 
-  // 메인 루프: 손 인식 + 광택 물리
+  // 손바닥이 문지른 자리의 바가지 머리를 조금씩 벗겨낸다
+  const wipePaint = useCallback((wipes: Wipe[]) => {
+    const canvas = paintCanvasRef.current;
+    if (!canvas || wipes.length === 0) return;
+    const r = canvas.getBoundingClientRect();
+    const k = r.width / canvas.width;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+    ctx.globalCompositeOperation = "destination-out";
+    for (const w of wipes) {
+      const x = (w.x - r.left) / k;
+      const y = (w.y - r.top) / k;
+      const radius = (w.size / k) * 0.8;
+      const a = Math.min(0.35, w.speed * WIPE_ALPHA);
+      const g = ctx.createRadialGradient(x, y, 0, x, y, radius);
+      g.addColorStop(0, `rgba(0,0,0,${a})`);
+      g.addColorStop(0.6, `rgba(0,0,0,${a * 0.6})`);
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(x - radius, y - radius, radius * 2, radius * 2);
+    }
+    ctx.globalCompositeOperation = "source-over";
+  }, []);
+
+  useEffect(() => {
+    const canvas = paintCanvasRef.current;
+    if (!canvas) return;
+    paintHead(canvas);
+    paintTotalRef.current = countPaint(canvas) || 1;
+  }, []);
+
+  // 태양이 된 순간을 카메라 화면 + 아저씨 합성 PNG로 저장
+  const capturePhoto = useCallback(async (seconds: number) => {
+    const svg = svgRef.current;
+    const video = videoRef.current;
+    if (!svg) return;
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const canvas = document.createElement("canvas");
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    const ctx = canvas.getContext("2d")!;
+    ctx.scale(dpr, dpr);
+
+    // 배경: 카메라 (화면과 똑같이 좌우 반전 + object-cover)
+    if (video && video.videoWidth) {
+      const scale = Math.max(W / video.videoWidth, H / video.videoHeight);
+      const dw = video.videoWidth * scale;
+      const dh = video.videoHeight * scale;
+      ctx.save();
+      ctx.translate(W, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, (W - dw) / 2, (H - dh) / 2, dw, dh);
+      ctx.restore();
+    } else {
+      ctx.fillStyle = "#10121f";
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // 머리에서 번지는 빛
+    const r = svg.getBoundingClientRect();
+    const k = r.width / 400;
+    const hx = r.left + 200 * k;
+    const hy = r.top + 150 * k;
+    const g = ctx.createRadialGradient(hx, hy, 0, hx, hy, Math.max(W, H) * 0.8);
+    g.addColorStop(0, "rgba(255,240,170,0.9)");
+    g.addColorStop(0.35, "rgba(255,200,80,0.35)");
+    g.addColorStop(1, "rgba(255,200,80,0)");
+    ctx.globalCompositeOperation = "screen";
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = "source-over";
+
+    // 아저씨: viewBox 밖으로 퍼지는 후광/광선까지 담기도록 넓혀서 래스터화
+    const PAD = 320;
+    const vbW = 400 + PAD * 2;
+    const vbH = 460 + PAD * 2;
+    const clone = svg.cloneNode(true) as SVGSVGElement;
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    clone.setAttribute("viewBox", `${-PAD} ${-PAD} ${vbW} ${vbH}`);
+    clone.setAttribute("width", String(vbW * k));
+    clone.setAttribute("height", String(vbH * k));
+    const url = URL.createObjectURL(
+      new Blob([new XMLSerializer().serializeToString(clone)], {
+        type: "image/svg+xml",
+      }),
+    );
+    try {
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      ctx.drawImage(img, r.left - PAD * k, r.top - PAD * k, vbW * k, vbH * k);
+      if (paintCanvasRef.current) {
+        ctx.drawImage(paintCanvasRef.current, r.left, r.top, r.width, r.height);
+      }
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+
+    // 기록 문구
+    const title = `☀️ ${seconds.toFixed(1)}초 만에 태양 달성`;
+    const sub = "funny.kkoreng.com/shine-my-bald";
+    ctx.font = "bold 30px -apple-system, 'Apple SD Gothic Neo', sans-serif";
+    const boxW = Math.max(ctx.measureText(title).width, 260) + 40;
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.beginPath();
+    ctx.roundRect(20, H - 120, boxW, 100, 18);
+    ctx.fill();
+    ctx.fillStyle = "#fff6c8";
+    ctx.fillText(title, 40, H - 70);
+    ctx.font = "16px -apple-system, 'Apple SD Gothic Neo', sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.8)";
+    ctx.fillText(sub, 40, H - 40);
+
+    const blob = await new Promise<Blob | null>((res) =>
+      canvas.toBlob(res, "image/png"),
+    );
+    if (blob) setPhoto(URL.createObjectURL(blob));
+  }, []);
+
+  // 메인 루프: 손 인식 + 머리카락/광택 물리
   useEffect(() => {
     let raf = 0;
     let last = performance.now();
+    let wipeFrames = 0;
 
     const tick = () => {
       const now = performance.now();
@@ -224,8 +409,21 @@ export default function ShineSimulator() {
       ) {
         lastVideoTimeRef.current = video.currentTime;
         const result = lmk.detectForVideo(video, now);
-        const { speed, onHead } = measureRub(result.landmarks, now);
+        const { speed, onHead, wipes } = measureRub(result.landmarks, now);
         handSpeedRef.current = Math.max(handSpeedRef.current, speed);
+        if (paintRef.current > 0 && !burnedOutRef.current) {
+          wipePaint(wipes);
+          if (wipes.length > 0 && ++wipeFrames % 6 === 0) {
+            const canvas = paintCanvasRef.current!;
+            const left = countPaint(canvas) / paintTotalRef.current;
+            if (left < PAINT_DONE) {
+              canvas.getContext("2d")!.clearRect(0, 0, canvas.width, canvas.height);
+              paintRef.current = 0;
+            } else {
+              paintRef.current = left;
+            }
+          }
+        }
         drawOverlay(result.landmarks, onHead);
       }
 
@@ -234,16 +432,46 @@ export default function ShineSimulator() {
       rubRef.current += (target - rubRef.current) * Math.min(1, dt * 8);
 
       if (!burnedOutRef.current) {
-        let s = shineRef.current + rubRef.current * GAIN * dt;
-        if (rubRef.current < 0.5) {
-          s -= DECAY * dt * (s > SUN_START ? 2 : 1);
+        if (startRef.current === null && rubRef.current > 1) {
+          startRef.current = now;
         }
-        s = Math.min(MAX_SHINE, Math.max(0, s));
-        if (s >= MAX_SHINE) burnedOutRef.current = true;
-        shineRef.current = s;
+        if (paintRef.current > 0) {
+          // 1단계: 바가지 머리를 벗긴 만큼 광택이 WIPE_SHINE까지 찬다 (닦기는 손 인식 쪽에서 처리)
+          shineRef.current = (1 - paintRef.current) * WIPE_SHINE;
+        } else {
+          // 2단계: 광택
+          let s = shineRef.current + rubRef.current * GAIN * dt;
+          if (rubRef.current < 0.5) {
+            s -= DECAY * dt * (s > SUN_START ? 2 : 1);
+          }
+          // 닦아낸 만큼의 광택은 줄어들지 않는다
+          s = Math.min(MAX_SHINE, Math.max(WIPE_SHINE, s));
+          shineRef.current = s;
+          if (s >= MAX_SHINE) {
+            burnedOutRef.current = true;
+            endRef.current = now;
+            const time = (now - (startRef.current ?? now)) / 1000;
+            let prevBest = Infinity;
+            try {
+              prevBest = Number(localStorage.getItem(BEST_KEY)) || Infinity;
+              if (time < prevBest) localStorage.setItem(BEST_KEY, String(time));
+            } catch {
+              // 저장소를 못 쓰는 환경이면 이번 기록만 보여준다
+            }
+            setResult({
+              time,
+              best: Math.min(time, prevBest),
+              isNew: time < prevBest,
+            });
+            capturePhoto(time).catch((e) => console.error("기념사진 실패", e));
+          }
+        }
       }
 
+      const start = startRef.current;
       setView({
+        paint: paintRef.current,
+        elapsed: start === null ? 0 : ((endRef.current ?? now) - start) / 1000,
         shine: shineRef.current,
         rub: rubRef.current,
         hands: handsRef.current,
@@ -255,7 +483,7 @@ export default function ShineSimulator() {
 
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [measureRub, drawOverlay]);
+  }, [measureRub, drawOverlay, wipePaint, capturePhoto]);
 
   useEffect(() => {
     return () => {
@@ -342,13 +570,20 @@ export default function ShineSimulator() {
   };
 
   const reset = () => {
+    paintRef.current = 1;
+    if (paintCanvasRef.current) paintHead(paintCanvasRef.current);
+    startRef.current = null;
+    endRef.current = null;
+    setResult(null);
+    if (photo) URL.revokeObjectURL(photo);
+    setPhoto(null);
     shineRef.current = 0;
     rubRef.current = 0;
     burnedOutRef.current = false;
   };
 
   // ---- 렌더링용 파생 값 ----
-  const { shine, rub, hands, onHead, burnedOut } = view;
+  const { paint, elapsed, shine, rub, hands, onHead, burnedOut } = view;
   const s = clamp01(shine / SUN_START);
   const sun = clamp01((shine - 85) / (MAX_SHINE - 85));
   const whiteout = burnedOut
@@ -390,7 +625,11 @@ export default function ShineSimulator() {
       {/* 옆에 서 있는 아저씨 */}
       <section className="pointer-events-none absolute bottom-0 right-0 z-10 w-[min(72vw,520px)] select-none md:right-[4vw]">
         <div className="relative w-full">
-          <svg viewBox="0 0 400 460" className="w-full overflow-visible">
+          <svg
+            ref={svgRef}
+            viewBox="0 0 400 460"
+            className="block w-full overflow-visible"
+          >
             <defs>
               <radialGradient id="glow">
                 <stop offset="0%" stopColor="#fffbe6" stopOpacity="1" />
@@ -466,16 +705,6 @@ export default function ShineSimulator() {
                 opacity={0.15 + 0.85 * s}
               />
             </g>
-
-            {/* 옆머리 */}
-            <path
-              d="M92,175 C88,215 100,250 115,262 C105,235 104,205 110,180Z"
-              fill="#8d8d8d"
-            />
-            <path
-              d="M308,175 C312,215 300,250 285,262 C295,235 296,205 290,180Z"
-              fill="#8d8d8d"
-            />
 
             {/* 하이라이트 */}
             <g transform="translate(155 100) rotate(-28)">
@@ -584,6 +813,14 @@ export default function ShineSimulator() {
             ))}
           </svg>
 
+          {/* 바가지 머리 (손이 닿은 곳만 벗겨짐) */}
+          <canvas
+            ref={paintCanvasRef}
+            width={400}
+            height={460}
+            className="absolute left-0 top-0 aspect-[400/460] w-full"
+          />
+
           {cam === "on" && onHead === 0 && !burnedOut && (
             <div className="absolute left-1/2 top-[2%] -translate-x-1/2 animate-bounce whitespace-nowrap rounded-full bg-black/50 px-4 py-1.5 text-lg font-bold text-yellow-200">
               👋 여기를 문질러요
@@ -594,7 +831,7 @@ export default function ShineSimulator() {
               className="pointer-events-none absolute left-1/2 top-[38%] -translate-x-1/2 animate-pulse whitespace-nowrap text-3xl font-black text-yellow-200 drop-shadow-[0_2px_6px_rgba(0,0,0,0.6)]"
               style={{ opacity: clamp01(rub / 6) }}
             >
-              슥삭슥삭!
+              {paint > 0 ? "벅벅…" : "슥삭슥삭!"}
             </div>
           )}
         </div>
@@ -607,7 +844,7 @@ export default function ShineSimulator() {
         </h1>
         <div>
           <div className="mb-1 flex items-baseline justify-between">
-            <span className="text-xs text-white/70">광택 레벨</span>
+            <span className="text-xs text-white/70">광택</span>
             <span className="font-mono text-xs">
               {Math.round((shine / SUN_START) * 100)}%
             </span>
@@ -622,7 +859,14 @@ export default function ShineSimulator() {
               }}
             />
           </div>
-          <div className="mt-1.5 text-lg font-bold">{level}</div>
+          <div className="mt-1.5 flex items-baseline justify-between">
+            <span className="text-lg font-bold">{level}</span>
+            {elapsed > 0 && (
+              <span className="font-mono text-sm text-white/80">
+                ⏱ {elapsed.toFixed(1)}초
+              </span>
+            )}
+          </div>
         </div>
 
         <div>
@@ -653,7 +897,7 @@ export default function ShineSimulator() {
           onClick={reset}
           className="rounded-lg border border-white/30 px-3 py-1.5 text-xs hover:bg-white/10"
         >
-          광택 초기화
+          처음부터 다시
         </button>
       </aside>
 
@@ -669,7 +913,7 @@ export default function ShineSimulator() {
                 📷 카메라 켜기
               </button>
               <span className="text-sm text-white/70">
-                화면 속 아저씨 머리 위에 손을 올리고 슥슥 문지르면 반짝여요
+                아저씨의 바가지 머리를 손으로 문질러 벗겨내고, 태양이 될 때까지 반짝이게 만드세요
               </span>
             </>
           )}
@@ -701,13 +945,44 @@ export default function ShineSimulator() {
         <div className="fixed inset-0 z-30 flex flex-col items-center justify-center gap-4 p-6 text-center text-neutral-800">
           <div className="text-6xl">☀️</div>
           <div className="text-3xl font-black">아저씨가 태양이 되었습니다</div>
-          <div className="text-neutral-500">너무 많이 비볐어요… 눈이 부셔서 아무것도 안 보여요</div>
-          <button
-            onClick={reset}
-            className="mt-2 rounded-full bg-neutral-900 px-6 py-3 font-bold text-white hover:bg-neutral-700"
-          >
-            선글라스 끼고 다시 하기 🕶️
-          </button>
+          {result && (
+            <div className="text-lg">
+              <b>{result.time.toFixed(1)}초</b> 만에 태양 달성{" "}
+              {result.isNew ? (
+                <span className="font-bold text-orange-500">🎉 신기록!</span>
+              ) : (
+                <span className="text-neutral-500">
+                  (최고 기록 {result.best.toFixed(1)}초)
+                </span>
+              )}
+            </div>
+          )}
+          {photo && (
+            // blob URL이라 next/image 최적화 대상이 아님
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={photo}
+              alt="태양이 된 아저씨 기념사진"
+              className="max-h-[38vh] max-w-full rounded-xl shadow-xl"
+            />
+          )}
+          <div className="mt-2 flex flex-wrap justify-center gap-3">
+            {photo && result && (
+              <a
+                href={photo}
+                download={`shine-my-bald-${result.time.toFixed(1)}s.png`}
+                className="rounded-full bg-orange-400 px-6 py-3 font-bold text-white hover:bg-orange-500"
+              >
+                📸 기념사진 저장
+              </a>
+            )}
+            <button
+              onClick={reset}
+              className="rounded-full bg-neutral-900 px-6 py-3 font-bold text-white hover:bg-neutral-700"
+            >
+              선글라스 끼고 다시 하기 🕶️
+            </button>
+          </div>
         </div>
       )}
     </div>
